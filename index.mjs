@@ -133,7 +133,7 @@ export async function init(router) {
     // Build vector cache once per search session (called before vectorizing multiple chats)
     router.post('/build-vector-cache', async (req, res) => {
         try {
-            const { source, model } = req.body;
+            const { source, model, collectionIds } = req.body;
             if (!source) {
                 return res.status(400).json({ error: 'source required' });
             }
@@ -143,7 +143,7 @@ export async function init(router) {
             const modelStr = sanitize(model || '');
             const userHandle = req.user.profile.handle;
 
-            const cache = buildVectorCache(vectorsDir, sourceStr, modelStr);
+            const cache = buildVectorCache(vectorsDir, sourceStr, modelStr, collectionIds);
             userCaches.set(userHandle, { source: sourceStr, model: modelStr, cache, ts: Date.now() });
 
             res.json({ cacheSize: cache.size });
@@ -233,18 +233,24 @@ export async function init(router) {
 }
 
 /**
- * Builds a hash→vector[] map from all existing vectra indexes for a given source/model.
+ * Builds a hash→vector[] map from existing vectra indexes for a given source/model.
+ * @param {string[]} [collectionIds] - If provided, only scan these collections
  */
-function buildVectorCache(vectorsDir, source, model) {
+function buildVectorCache(vectorsDir, source, model, collectionIds) {
     const cache = new Map();
     const sourcePath = path.join(vectorsDir, source);
 
     if (!fs.existsSync(sourcePath)) return cache;
 
-    const collections = safeReaddirSync(sourcePath).filter(f => {
-        try { return fs.statSync(path.join(sourcePath, f)).isDirectory(); }
-        catch { return false; }
-    });
+    let collections;
+    if (Array.isArray(collectionIds) && collectionIds.length > 0) {
+        collections = collectionIds.map(id => sanitize(id));
+    } else {
+        collections = safeReaddirSync(sourcePath).filter(f => {
+            try { return fs.statSync(path.join(sourcePath, f)).isDirectory(); }
+            catch { return false; }
+        });
+    }
 
     for (const col of collections) {
         const indexFile = path.join(sourcePath, col, model, 'index.json');
