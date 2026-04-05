@@ -9,6 +9,11 @@ export const info = {
     description: 'Global full-text search across all chats',
 };
 
+// Per-user vector cache, built once per search session
+// key: userHandle, value: { source, model, cache: Map<hash, [{vector, text}]>, ts }
+const userCaches = new Map();
+const CACHE_TTL = 60_000; // 1 minute
+
 export async function init(router) {
     // Keyword search
     router.post('/search', async (req, res) => {
@@ -125,8 +130,30 @@ export async function init(router) {
         }
     });
 
-    // Build hash→vector cache from existing collections, then insert items
-    // reusing cached vectors where possible. Returns hashes that need API embedding.
+    // Build vector cache once per search session (called before vectorizing multiple chats)
+    router.post('/build-vector-cache', async (req, res) => {
+        try {
+            const { source, model } = req.body;
+            if (!source) {
+                return res.status(400).json({ error: 'source required' });
+            }
+
+            const vectorsDir = req.user.directories.vectors;
+            const sourceStr = sanitize(source);
+            const modelStr = sanitize(model || '');
+            const userHandle = req.user.profile.handle;
+
+            const cache = buildVectorCache(vectorsDir, sourceStr, modelStr);
+            userCaches.set(userHandle, { source: sourceStr, model: modelStr, cache, ts: Date.now() });
+
+            res.json({ cacheSize: cache.size });
+        } catch (error) {
+            console.error('Build vector cache error:', error);
+            res.status(500).json({ error: error.message });
+        }
+    });
+
+    // Insert items using cached vectors where possible
     router.post('/vector-insert-cached', async (req, res) => {
         try {
             const { collectionId, source, model, items } = req.body;
@@ -137,25 +164,33 @@ export async function init(router) {
             const vectorsDir = req.user.directories.vectors;
             const modelStr = sanitize(model || '');
             const sourceStr = sanitize(source);
+            const userHandle = req.user.profile.handle;
 
-            // Build hash→vector cache from all existing collections of the same source/model
-            const cache = buildVectorCache(vectorsDir, sourceStr, modelStr);
+            // Use pre-built cache if available and fresh, otherwise build on-the-fly
+            let cache;
+            const cached = userCaches.get(userHandle);
+            if (cached && cached.source === sourceStr && cached.model === modelStr && (Date.now() - cached.ts) < CACHE_TTL) {
+                cache = cached.cache;
+            } else {
+                cache = buildVectorCache(vectorsDir, sourceStr, modelStr);
+                userCaches.set(userHandle, { source: sourceStr, model: modelStr, cache, ts: Date.now() });
+            }
 
             // Split items into cached (have vectors) and uncached (need API call)
-            const cached = [];
-            const uncached = [];
+            const cachedItems = [];
+            const uncachedItems = [];
 
             for (const item of items) {
                 const key = Number(item.hash);
                 if (cache.has(key)) {
-                    cached.push({ ...item, cachedVectors: cache.get(key) });
+                    cachedItems.push({ ...item, cachedVectors: cache.get(key) });
                 } else {
-                    uncached.push(item);
+                    uncachedItems.push(item);
                 }
             }
 
             // Insert cached items directly into vectra
-            if (cached.length > 0) {
+            if (cachedItems.length > 0) {
                 const indexPath = path.join(vectorsDir, sourceStr, sanitize(collectionId), modelStr);
                 const store = new vectra.LocalIndex(indexPath);
                 if (!await store.isIndexCreated()) {
@@ -163,7 +198,7 @@ export async function init(router) {
                 }
 
                 await store.beginUpdate();
-                for (const item of cached) {
+                for (const item of cachedItems) {
                     for (const cv of item.cachedVectors) {
                         await store.upsertItem({
                             vector: cv.vector,
@@ -176,12 +211,19 @@ export async function init(router) {
                     }
                 }
                 await store.endUpdate();
+
+                // Add newly inserted vectors to cache so subsequent chats can reuse them
+                for (const item of cachedItems) {
+                    const key = Number(item.hash);
+                    if (!cache.has(key)) {
+                        cache.set(key, item.cachedVectors);
+                    }
+                }
             }
 
-            // Return uncached hashes so frontend can call /api/vector/insert for those only
             res.json({
-                cachedCount: cached.length,
-                uncachedItems: uncached,
+                cachedCount: cachedItems.length,
+                uncachedItems,
             });
         } catch (error) {
             console.error('Vector insert cached error:', error);
@@ -192,10 +234,6 @@ export async function init(router) {
 
 /**
  * Builds a hash→vector[] map from all existing vectra indexes for a given source/model.
- * @param {string} vectorsDir - Path to vectors directory
- * @param {string} source - Sanitized source name
- * @param {string} model - Sanitized model name
- * @returns {Map<number, Array<{vector: number[], text: string}>>}
  */
 function buildVectorCache(vectorsDir, source, model) {
     const cache = new Map();
@@ -223,7 +261,6 @@ function buildVectorCache(vectorsDir, source, model) {
                 if (!cache.has(hash)) {
                     cache.set(hash, []);
                 }
-                // Only store unique text chunks per hash (avoid duplicates in cache)
                 const existing = cache.get(hash);
                 if (!existing.some(e => e.text === item.metadata.text)) {
                     existing.push({ vector: item.vector, text: item.metadata.text });
