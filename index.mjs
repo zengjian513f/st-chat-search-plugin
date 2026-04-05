@@ -8,13 +8,13 @@ export const info = {
 };
 
 export async function init(router) {
+    // Keyword search
     router.post('/search', async (req, res) => {
         try {
             const {
                 query,
-                scope = 'all',           // 'current_chat' | 'current_character' | 'all'
-                characterName,            // required for current_chat / current_character
-                chatFile,                 // required for current_chat
+                scope = 'all',
+                characterName,
             } = req.body;
 
             if (!query || !query.trim()) {
@@ -28,100 +28,144 @@ export async function init(router) {
 
             const chatsDir = req.user.directories.chats;
             const results = [];
-
-            // Determine which character directories to scan
-            let charDirs;
-            if (scope === 'current_chat' || scope === 'current_character') {
-                if (!characterName) {
-                    return res.status(400).json({ error: 'characterName required for this scope' });
-                }
-                charDirs = [characterName];
-            } else {
-                charDirs = safeReaddirSync(chatsDir).filter(f => {
-                    try { return fs.statSync(path.join(chatsDir, f)).isDirectory(); }
-                    catch { return false; }
-                });
-            }
+            const charDirs = getCharDirs(chatsDir, scope, characterName);
 
             for (const charName of charDirs) {
                 const charPath = path.join(chatsDir, charName);
                 if (!fs.existsSync(charPath)) continue;
 
-                let files = safeReaddirSync(charPath).filter(f => f.endsWith('.jsonl'));
-
-                // For current_chat scope, only scan the specific file
-                if (scope === 'current_chat' && chatFile) {
-                    const target = chatFile.endsWith('.jsonl') ? chatFile : chatFile + '.jsonl';
-                    files = files.filter(f => f === target);
-                }
+                const files = safeReaddirSync(charPath).filter(f => f.endsWith('.jsonl'));
 
                 for (const file of files) {
-                    const filePath = path.join(charPath, file);
-                    let content;
-                    try {
-                        content = fs.readFileSync(filePath, 'utf-8');
-                    } catch {
-                        continue;
-                    }
+                    const { meta, messages } = readChat(path.join(charPath, file));
+                    if (!meta) continue;
 
-                    const lines = content.split('\n').filter(Boolean);
-                    if (lines.length < 2) continue;
+                    const chatCreateDate = meta.create_date || file.replace('.jsonl', '');
 
-                    // First line is metadata
-                    let chatMeta;
-                    try {
-                        chatMeta = JSON.parse(lines[0]);
-                    } catch {
-                        continue;
-                    }
-
-                    const chatCreateDate = chatMeta.create_date || file.replace('.jsonl', '');
-
-                    // Find the first matching message in this chat
-                    for (let i = 1; i < lines.length; i++) {
-                        let msg;
-                        try {
-                            msg = JSON.parse(lines[i]);
-                        } catch {
-                            continue;
-                        }
+                    for (const msg of messages) {
                         if (!msg.mes) continue;
-
                         const lower = msg.mes.toLowerCase();
                         if (keywords.every(kw => lower.includes(kw))) {
                             results.push({
                                 character: charName,
                                 file: file.replace('.jsonl', ''),
                                 chatCreateDate,
-                                messageIndex: i,
+                                messageIndex: msg._lineIndex,
                                 name: msg.name,
                                 is_user: !!msg.is_user,
                                 mes: msg.mes,
                                 send_date: msg.send_date,
                             });
-                            break; // Only first match per chat
+                            break;
                         }
                     }
                 }
             }
 
-            // Sort by chat create date descending (newest first)
-            results.sort((a, b) => {
-                return b.chatCreateDate.localeCompare(a.chatCreateDate);
-            });
-
+            results.sort((a, b) => b.chatCreateDate.localeCompare(a.chatCreateDate));
             res.json({ results, count: results.length });
         } catch (error) {
             console.error('Chat search error:', error);
             res.status(500).json({ error: error.message });
         }
     });
+
+    // List all chat collection IDs in scope (for vector search)
+    router.post('/list-chats', async (req, res) => {
+        try {
+            const { scope = 'all', characterName } = req.body;
+            const chatsDir = req.user.directories.chats;
+            const charDirs = getCharDirs(chatsDir, scope, characterName);
+            const chats = [];
+
+            for (const charName of charDirs) {
+                const charPath = path.join(chatsDir, charName);
+                if (!fs.existsSync(charPath)) continue;
+
+                const files = safeReaddirSync(charPath).filter(f => f.endsWith('.jsonl'));
+                for (const file of files) {
+                    const collectionId = file.replace('.jsonl', '');
+                    const { messages } = readChat(path.join(charPath, file));
+                    const messageCount = messages.filter(m => m.mes && !m.is_system).length;
+                    chats.push({ character: charName, file: collectionId, messageCount });
+                }
+            }
+
+            res.json(chats);
+        } catch (error) {
+            console.error('List chats error:', error);
+            res.status(500).json({ error: error.message });
+        }
+    });
+
+    // Extract messages from a chat for vectorization
+    router.post('/chat-messages', async (req, res) => {
+        try {
+            const { character, file } = req.body;
+            if (!character || !file) {
+                return res.status(400).json({ error: 'character and file required' });
+            }
+
+            const chatsDir = req.user.directories.chats;
+            const filePath = path.join(chatsDir, character, file + '.jsonl');
+            const { messages } = readChat(filePath);
+
+            const items = messages
+                .filter(m => m.mes && !m.is_system)
+                .map(m => ({
+                    text: m.mes,
+                    index: m._lineIndex,
+                    name: m.name,
+                    is_user: !!m.is_user,
+                    send_date: m.send_date,
+                }));
+
+            res.json(items);
+        } catch (error) {
+            console.error('Chat messages error:', error);
+            res.status(500).json({ error: error.message });
+        }
+    });
+}
+
+function getCharDirs(chatsDir, scope, characterName) {
+    if (scope === 'current_character') {
+        if (!characterName) return [];
+        return [characterName];
+    }
+    return safeReaddirSync(chatsDir).filter(f => {
+        try { return fs.statSync(path.join(chatsDir, f)).isDirectory(); }
+        catch { return false; }
+    });
+}
+
+function readChat(filePath) {
+    let content;
+    try {
+        content = fs.readFileSync(filePath, 'utf-8');
+    } catch {
+        return { meta: null, messages: [] };
+    }
+
+    const lines = content.split('\n').filter(Boolean);
+    if (lines.length < 2) return { meta: null, messages: [] };
+
+    let meta;
+    try { meta = JSON.parse(lines[0]); } catch { return { meta: null, messages: [] }; }
+
+    const messages = [];
+    for (let i = 1; i < lines.length; i++) {
+        try {
+            const msg = JSON.parse(lines[i]);
+            msg._lineIndex = i;
+            messages.push(msg);
+        } catch { /* skip */ }
+    }
+
+    return { meta, messages };
 }
 
 function safeReaddirSync(dirPath) {
-    try {
-        return fs.readdirSync(dirPath);
-    } catch {
-        return [];
-    }
+    try { return fs.readdirSync(dirPath); }
+    catch { return []; }
 }
