@@ -17,6 +17,9 @@ export const info = {
     description: 'Global full-text search across all chats',
 };
 
+// Serialize vectorize jobs — new request waits for previous to finish
+let jobQueue = Promise.resolve();
+
 export async function init(router) {
     // ==================== Keyword Search ====================
     router.post('/search', async (req, res) => {
@@ -85,6 +88,9 @@ export async function init(router) {
             return res.status(400).json({ error: 'source required' });
         }
 
+        // Wait for any previous job to finish
+        await jobQueue;
+
         // Disable compression for SSE
         req.headers['accept-encoding'] = 'identity';
 
@@ -96,6 +102,9 @@ export async function init(router) {
             'X-Accel-Buffering': 'no',
             'Content-Encoding': 'identity',
         });
+
+        let jobResolve;
+        jobQueue = new Promise(r => { jobResolve = r; });
 
         let aborted = false;
         req.on('close', () => { aborted = true; });
@@ -162,14 +171,14 @@ export async function init(router) {
 
             for (const chat of needsWork) {
                 if (aborted) {
-                    console.log('[chat-search] Aborted by client');
+                    console.log('[chat-search] Aborted');
                     break;
                 }
                 done++;
                 send('progress', { phase: 'vectorize', done, total: needsWork.length, message: `${chat.character}/${chat.file}` });
 
                 try {
-                    const stats = await vectorizeChat(chat, chatsDir, vectorsDir, sourceStr, modelStr, source, model || '', chunkSize, delimiters, cache, port, req);
+                    const stats = await vectorizeChat(chat, chatsDir, vectorsDir, sourceStr, modelStr, source, model || '', chunkSize, delimiters, cache, port, req, () => aborted);
                     console.log(`[chat-search] ${chat.file}: total=${stats.totalChunks}, cached=${stats.cached}, uncached=${stats.uncached}, API requests=${stats.apiRequests}`);
                 } catch (err) {
                     console.warn(`[chat-search] Failed to vectorize ${chat.file}:`, err.message);
@@ -182,6 +191,7 @@ export async function init(router) {
             send('error', { message: error.message });
         }
 
+        jobResolve();
         res.end();
     });
 
@@ -288,7 +298,7 @@ async function getQueryVector(source, text, directories, model) {
 
 // ==================== Vectorize a single chat ====================
 
-async function vectorizeChat(chat, chatsDir, vectorsDir, source, model, rawSource, rawModel, chunkSize, delimiters, cache, port, req) {
+async function vectorizeChat(chat, chatsDir, vectorsDir, source, model, rawSource, rawModel, chunkSize, delimiters, cache, port, req, isAborted) {
     // Read messages
     const filePath = path.join(chatsDir, chat.character, chat.file + '.jsonl');
     const { messages } = readChat(filePath);
@@ -355,6 +365,7 @@ async function vectorizeChat(chat, chatsDir, vectorsDir, source, model, rawSourc
         };
 
         for (let i = 0; i < uncachedItems.length; i += batchSize) {
+            if (isAborted()) break;
             const batch = uncachedItems.slice(i, i + batchSize);
             apiRequests++;
 
