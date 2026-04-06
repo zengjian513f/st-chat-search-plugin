@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import vectra from 'vectra';
 import sanitize from 'sanitize-filename';
+import { getConfigValue } from '../../src/util.js';
 
 export const info = {
     id: 'chat-search',
@@ -9,13 +10,8 @@ export const info = {
     description: 'Global full-text search across all chats',
 };
 
-// Per-user vector cache, built once per search session
-// key: userHandle, value: { source, model, cache: Map<hash, [{vector, text}]>, ts }
-const userCaches = new Map();
-const CACHE_TTL = 60_000; // 1 minute
-
 export async function init(router) {
-    // Keyword search
+    // ==================== Keyword Search ====================
     router.post('/search', async (req, res) => {
         try {
             const { query, scope = 'all', characterName } = req.body;
@@ -73,7 +69,102 @@ export async function init(router) {
         }
     });
 
-    // List all chat collection IDs in scope (for vector search)
+    // ==================== Vectorize All (SSE) ====================
+    router.post('/vectorize-all', async (req, res) => {
+        const { scope = 'all', characterName, source, model, chunkSize = 400 } = req.body;
+
+        if (!source) {
+            return res.status(400).json({ error: 'source required' });
+        }
+
+        // SSE headers
+        res.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'X-Accel-Buffering': 'no',
+        });
+
+        const send = (event, data) => {
+            res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+        };
+
+        try {
+            const chatsDir = req.user.directories.chats;
+            const vectorsDir = req.user.directories.vectors;
+            const sourceStr = sanitize(source);
+            const modelStr = sanitize(model || '');
+            const charDirs = getCharDirs(chatsDir, scope, characterName);
+            const delimiters = ['\n\n', '\n', ' ', ''];
+
+            // Step 1: List all chats
+            const allChats = [];
+            for (const charName of charDirs) {
+                const charPath = path.join(chatsDir, charName);
+                if (!fs.existsSync(charPath)) continue;
+
+                const files = safeReaddirSync(charPath).filter(f => f.endsWith('.jsonl'));
+                for (const file of files) {
+                    const collectionId = file.replace('.jsonl', '');
+                    allChats.push({ character: charName, file: collectionId });
+                }
+            }
+
+            // Step 2: Check which chats need vectorization
+            const needsWork = [];
+            const readyIds = [];
+
+            for (const chat of allChats) {
+                const indexPath = path.join(vectorsDir, sourceStr, sanitize(chat.file), modelStr, 'index.json');
+                if (fs.existsSync(indexPath)) {
+                    try {
+                        const data = JSON.parse(fs.readFileSync(indexPath, 'utf-8'));
+                        if (data.items && data.items.length > 0) {
+                            readyIds.push(chat.file);
+                            continue;
+                        }
+                    } catch { /* treat as needing work */ }
+                }
+                needsWork.push(chat);
+            }
+
+            if (needsWork.length === 0) {
+                send('complete', { collectionIds: allChats.map(c => c.file) });
+                res.end();
+                return;
+            }
+
+            // Step 3: Build hash→vector cache from already-vectorized collections
+            send('progress', { phase: 'cache', done: 0, total: needsWork.length, message: 'Building vector cache...' });
+            const cache = buildVectorCache(vectorsDir, sourceStr, modelStr, readyIds);
+            console.log(`[chat-search] Vector cache built: ${cache.size} unique hashes from ${readyIds.length} collections`);
+
+            // Step 4: Process each chat
+            const port = getConfigValue('port', 8000, 'number');
+            let done = 0;
+
+            for (const chat of needsWork) {
+                done++;
+                send('progress', { phase: 'vectorize', done, total: needsWork.length, message: `${chat.character}/${chat.file}` });
+
+                try {
+                    const stats = await vectorizeChat(chat, chatsDir, vectorsDir, sourceStr, modelStr, chunkSize, delimiters, cache, port, req);
+                    console.log(`[chat-search] ${chat.file}: total=${stats.totalChunks}, cached=${stats.cached}, uncached=${stats.uncached}, API requests=${stats.apiRequests}`);
+                } catch (err) {
+                    console.warn(`[chat-search] Failed to vectorize ${chat.file}:`, err.message);
+                }
+            }
+
+            send('complete', { collectionIds: allChats.map(c => c.file) });
+        } catch (error) {
+            console.error('Vectorize-all error:', error);
+            send('error', { message: error.message });
+        }
+
+        res.end();
+    });
+
+    // ==================== List Chats (still needed for query) ====================
     router.post('/list-chats', async (req, res) => {
         try {
             const { scope = 'all', characterName } = req.body;
@@ -87,10 +178,7 @@ export async function init(router) {
 
                 const files = safeReaddirSync(charPath).filter(f => f.endsWith('.jsonl'));
                 for (const file of files) {
-                    const collectionId = file.replace('.jsonl', '');
-                    const { messages } = readChat(path.join(charPath, file));
-                    const messageCount = messages.filter(m => m.mes && !m.is_system).length;
-                    chats.push({ character: charName, file: collectionId, messageCount });
+                    chats.push({ character: charName, file: file.replace('.jsonl', '') });
                 }
             }
 
@@ -100,142 +188,124 @@ export async function init(router) {
             res.status(500).json({ error: error.message });
         }
     });
-
-    // Extract messages from a chat for vectorization
-    router.post('/chat-messages', async (req, res) => {
-        try {
-            const { character, file } = req.body;
-            if (!character || !file) {
-                return res.status(400).json({ error: 'character and file required' });
-            }
-
-            const chatsDir = req.user.directories.chats;
-            const filePath = path.join(chatsDir, character, file + '.jsonl');
-            const { messages } = readChat(filePath);
-
-            const items = messages
-                .filter(m => m.mes && !m.is_system)
-                .map(m => ({
-                    text: m.mes,
-                    index: m._lineIndex,
-                    name: m.name,
-                    is_user: !!m.is_user,
-                    send_date: m.send_date,
-                }));
-
-            res.json(items);
-        } catch (error) {
-            console.error('Chat messages error:', error);
-            res.status(500).json({ error: error.message });
-        }
-    });
-
-    // Build vector cache once per search session (called before vectorizing multiple chats)
-    router.post('/build-vector-cache', async (req, res) => {
-        try {
-            const { source, model, collectionIds } = req.body;
-            if (!source) {
-                return res.status(400).json({ error: 'source required' });
-            }
-
-            const vectorsDir = req.user.directories.vectors;
-            const sourceStr = sanitize(source);
-            const modelStr = sanitize(model || '');
-            const userHandle = req.user.profile.handle;
-
-            const cache = buildVectorCache(vectorsDir, sourceStr, modelStr, collectionIds);
-            userCaches.set(userHandle, { source: sourceStr, model: modelStr, cache, ts: Date.now() });
-
-            res.json({ cacheSize: cache.size });
-        } catch (error) {
-            console.error('Build vector cache error:', error);
-            res.status(500).json({ error: error.message });
-        }
-    });
-
-    // Insert items using cached vectors where possible
-    router.post('/vector-insert-cached', async (req, res) => {
-        try {
-            const { collectionId, source, model, items } = req.body;
-            if (!collectionId || !source || !Array.isArray(items)) {
-                return res.status(400).json({ error: 'collectionId, source, and items required' });
-            }
-
-            const vectorsDir = req.user.directories.vectors;
-            const modelStr = sanitize(model || '');
-            const sourceStr = sanitize(source);
-            const userHandle = req.user.profile.handle;
-
-            // Use pre-built cache if available and fresh, otherwise build on-the-fly
-            let cache;
-            const cached = userCaches.get(userHandle);
-            if (cached && cached.source === sourceStr && cached.model === modelStr && (Date.now() - cached.ts) < CACHE_TTL) {
-                cache = cached.cache;
-            } else {
-                cache = buildVectorCache(vectorsDir, sourceStr, modelStr);
-                userCaches.set(userHandle, { source: sourceStr, model: modelStr, cache, ts: Date.now() });
-            }
-
-            // Split items into cached (have vectors) and uncached (need API call)
-            const cachedItems = [];
-            const uncachedItems = [];
-
-            for (const item of items) {
-                const key = Number(item.hash);
-                if (cache.has(key)) {
-                    cachedItems.push({ ...item, cachedVectors: cache.get(key) });
-                } else {
-                    uncachedItems.push(item);
-                }
-            }
-
-            // Insert cached items directly into vectra
-            if (cachedItems.length > 0) {
-                const indexPath = path.join(vectorsDir, sourceStr, sanitize(collectionId), modelStr);
-                const store = new vectra.LocalIndex(indexPath);
-                if (!await store.isIndexCreated()) {
-                    await store.createIndex();
-                }
-
-                await store.beginUpdate();
-                for (const item of cachedItems) {
-                    for (const cv of item.cachedVectors) {
-                        await store.upsertItem({
-                            vector: cv.vector,
-                            metadata: {
-                                hash: Number(item.hash),
-                                text: cv.text,
-                                index: item.index,
-                            },
-                        });
-                    }
-                }
-                await store.endUpdate();
-
-                // Add newly inserted vectors to cache so subsequent chats can reuse them
-                for (const item of cachedItems) {
-                    const key = Number(item.hash);
-                    if (!cache.has(key)) {
-                        cache.set(key, item.cachedVectors);
-                    }
-                }
-            }
-
-            res.json({
-                cachedCount: cachedItems.length,
-                uncachedItems,
-            });
-        } catch (error) {
-            console.error('Vector insert cached error:', error);
-            res.status(500).json({ error: error.message });
-        }
-    });
 }
 
-/**
- * Builds a hash→vector[] map from existing vectra indexes for a given source/model.
- * @param {string[]} [collectionIds] - If provided, only scan these collections
- */
+// ==================== Vectorize a single chat ====================
+
+async function vectorizeChat(chat, chatsDir, vectorsDir, source, model, chunkSize, delimiters, cache, port, req) {
+    // Read messages
+    const filePath = path.join(chatsDir, chat.character, chat.file + '.jsonl');
+    const { messages } = readChat(filePath);
+    const validMessages = messages.filter(m => m.mes && !m.is_system);
+
+    if (validMessages.length === 0) {
+        return { totalChunks: 0, cached: 0, uncached: 0, apiRequests: 0 };
+    }
+
+    // Chunk and hash
+    const items = [];
+    for (const m of validMessages) {
+        const hash = getStringHash(m.mes);
+        if (chunkSize > 0 && m.mes.length > chunkSize) {
+            const chunks = splitRecursive(m.mes, chunkSize, delimiters);
+            for (const chunk of chunks) {
+                items.push({ hash, text: chunk, index: m._lineIndex });
+            }
+        } else {
+            items.push({ hash, text: m.mes, index: m._lineIndex });
+        }
+    }
+
+    // Check cache
+    const cachedItems = [];
+    const uncachedItems = [];
+
+    for (const item of items) {
+        if (cache.has(item.hash)) {
+            cachedItems.push({ ...item, cachedVectors: cache.get(item.hash) });
+        } else {
+            uncachedItems.push(item);
+        }
+    }
+
+    // Insert cached items directly via vectra
+    if (cachedItems.length > 0) {
+        const indexPath = path.join(vectorsDir, source, sanitize(chat.file), model);
+        const store = new vectra.LocalIndex(indexPath);
+        if (!await store.isIndexCreated()) {
+            await store.createIndex();
+        }
+
+        await store.beginUpdate();
+        for (const item of cachedItems) {
+            for (const cv of item.cachedVectors) {
+                await store.upsertItem({
+                    vector: cv.vector,
+                    metadata: { hash: item.hash, text: cv.text, index: item.index },
+                });
+            }
+        }
+        await store.endUpdate();
+    }
+
+    // Call embedding API for uncached items
+    let apiRequests = 0;
+    if (uncachedItems.length > 0) {
+        const batchSize = 10;
+        const headers = {
+            'Content-Type': 'application/json',
+            'Cookie': req.headers.cookie || '',
+            'X-CSRF-Token': req.headers['x-csrf-token'] || '',
+        };
+
+        for (let i = 0; i < uncachedItems.length; i += batchSize) {
+            const batch = uncachedItems.slice(i, i + batchSize);
+            apiRequests++;
+
+            const resp = await fetch(`http://127.0.0.1:${port}/api/vector/insert`, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                    collectionId: chat.file,
+                    source,
+                    model,
+                    items: batch,
+                }),
+            });
+
+            if (!resp.ok) {
+                throw new Error(`Vector insert API returned ${resp.status}`);
+            }
+
+            // Add newly embedded vectors to cache
+            try {
+                const indexPath = path.join(vectorsDir, source, sanitize(chat.file), model, 'index.json');
+                if (fs.existsSync(indexPath)) {
+                    const data = JSON.parse(fs.readFileSync(indexPath, 'utf-8'));
+                    for (const vecItem of (data.items || [])) {
+                        const h = Number(vecItem.metadata?.hash);
+                        if (!h || !vecItem.vector) continue;
+                        if (!cache.has(h)) cache.set(h, []);
+                        const arr = cache.get(h);
+                        if (!arr.some(e => e.text === vecItem.metadata.text)) {
+                            arr.push({ vector: vecItem.vector, text: vecItem.metadata.text });
+                        }
+                    }
+                }
+            } catch { /* ignore cache update errors */ }
+        }
+    }
+
+    return {
+        totalChunks: items.length,
+        cached: cachedItems.length,
+        uncached: uncachedItems.length,
+        apiRequests,
+    };
+}
+
+// ==================== Vector Cache ====================
+
 function buildVectorCache(vectorsDir, source, model, collectionIds) {
     const cache = new Map();
     const sourcePath = path.join(vectorsDir, source);
@@ -264,20 +334,57 @@ function buildVectorCache(vectorsDir, source, model, collectionIds) {
                 const hash = Number(item.metadata?.hash);
                 if (!hash || !item.vector) continue;
 
-                if (!cache.has(hash)) {
-                    cache.set(hash, []);
-                }
+                if (!cache.has(hash)) cache.set(hash, []);
                 const existing = cache.get(hash);
                 if (!existing.some(e => e.text === item.metadata.text)) {
                     existing.push({ vector: item.vector, text: item.metadata.text });
                 }
             }
-        } catch {
-            // Skip corrupted indexes
-        }
+        } catch { /* skip corrupted */ }
     }
 
     return cache;
+}
+
+// ==================== Utilities ====================
+
+function getStringHash(str, seed = 0) {
+    if (typeof str !== 'string') return 0;
+    let h1 = 0xdeadbeef ^ seed, h2 = 0x41c6ce57 ^ seed;
+    for (let i = 0, ch; i < str.length; i++) {
+        ch = str.charCodeAt(i);
+        h1 = Math.imul(h1 ^ ch, 2654435761);
+        h2 = Math.imul(h2 ^ ch, 1597334677);
+    }
+    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    return 4294967296 * (2097151 & h2) + (h1 >>> 0);
+}
+
+function splitRecursive(input, length, delimiters = ['\n\n', '\n', ' ', '']) {
+    if (length <= 0) return [input];
+    const delim = delimiters[0] ?? '';
+    const parts = input.split(delim);
+    const flatParts = parts.flatMap(p => {
+        if (p.length < length) return p;
+        return splitRecursive(p, length, delimiters.slice(1));
+    });
+    const result = [];
+    let currentChunk = '';
+    for (let i = 0; i < flatParts.length;) {
+        currentChunk = flatParts[i];
+        let j = i + 1;
+        while (j < flatParts.length) {
+            const nextChunk = flatParts[j];
+            if (currentChunk.length + nextChunk.length + delim.length <= length) {
+                currentChunk += delim + nextChunk;
+            } else break;
+            j++;
+        }
+        i = j;
+        result.push(currentChunk);
+    }
+    return result;
 }
 
 function getCharDirs(chatsDir, scope, characterName) {
@@ -293,11 +400,8 @@ function getCharDirs(chatsDir, scope, characterName) {
 
 function readChat(filePath) {
     let content;
-    try {
-        content = fs.readFileSync(filePath, 'utf-8');
-    } catch {
-        return { meta: null, messages: [] };
-    }
+    try { content = fs.readFileSync(filePath, 'utf-8'); }
+    catch { return { meta: null, messages: [] }; }
 
     const lines = content.split('\n').filter(Boolean);
     if (lines.length < 2) return { meta: null, messages: [] };
