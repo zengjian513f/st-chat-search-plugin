@@ -3,6 +3,13 @@ import path from 'node:path';
 import vectra from 'vectra';
 import sanitize from 'sanitize-filename';
 import { getConfigValue } from '../../src/util.js';
+import { getOpenAIVector } from '../../src/vectors/openai-vectors.js';
+import { getTransformersVector } from '../../src/vectors/embedding.js';
+import { getCohereVector } from '../../src/vectors/cohere-vectors.js';
+import { getNomicAIVector } from '../../src/vectors/nomicai-vectors.js';
+import { getOllamaVector } from '../../src/vectors/ollama-vectors.js';
+import { getLlamaCppVector } from '../../src/vectors/llamacpp-vectors.js';
+import { getVllmVector } from '../../src/vectors/vllm-vectors.js';
 
 export const info = {
     id: 'chat-search',
@@ -14,7 +21,7 @@ export async function init(router) {
     // ==================== Keyword Search ====================
     router.post('/search', async (req, res) => {
         try {
-            const { query, scope = 'all', characterName } = req.body;
+            const { query, scope = 'all', characterName, onePerChat = true } = req.body;
 
             if (!query || !query.trim()) {
                 return res.status(400).json({ error: 'Query required' });
@@ -55,7 +62,7 @@ export async function init(router) {
                                 mes: msg.mes,
                                 send_date: msg.send_date,
                             });
-                            break;
+                            if (onePerChat) break;
                         }
                     }
                 }
@@ -70,12 +77,16 @@ export async function init(router) {
     });
 
     // ==================== Vectorize All (SSE) ====================
-    router.post('/vectorize-all', async (req, res) => {
-        const { scope = 'all', characterName, source, model, chunkSize = 400 } = req.body;
+    router.get('/vectorize-all', async (req, res) => {
+        const { scope = 'all', characterName, source, model } = req.query;
+        const chunkSize = Number(req.query.chunkSize) || 400;
 
         if (!source) {
             return res.status(400).json({ error: 'source required' });
         }
+
+        // Disable compression for SSE
+        req.headers['accept-encoding'] = 'identity';
 
         // SSE headers
         res.writeHead(200, {
@@ -83,10 +94,16 @@ export async function init(router) {
             'Cache-Control': 'no-cache',
             'Connection': 'keep-alive',
             'X-Accel-Buffering': 'no',
+            'Content-Encoding': 'identity',
         });
 
+        let aborted = false;
+        req.on('close', () => { aborted = true; });
+
         const send = (event, data) => {
+            if (aborted) return;
             res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+            if (typeof res.flush === 'function') res.flush();
         };
 
         try {
@@ -144,11 +161,15 @@ export async function init(router) {
             let done = 0;
 
             for (const chat of needsWork) {
+                if (aborted) {
+                    console.log('[chat-search] Aborted by client');
+                    break;
+                }
                 done++;
                 send('progress', { phase: 'vectorize', done, total: needsWork.length, message: `${chat.character}/${chat.file}` });
 
                 try {
-                    const stats = await vectorizeChat(chat, chatsDir, vectorsDir, sourceStr, modelStr, chunkSize, delimiters, cache, port, req);
+                    const stats = await vectorizeChat(chat, chatsDir, vectorsDir, sourceStr, modelStr, source, model || '', chunkSize, delimiters, cache, port, req);
                     console.log(`[chat-search] ${chat.file}: total=${stats.totalChunks}, cached=${stats.cached}, uncached=${stats.uncached}, API requests=${stats.apiRequests}`);
                 } catch (err) {
                     console.warn(`[chat-search] Failed to vectorize ${chat.file}:`, err.message);
@@ -188,11 +209,86 @@ export async function init(router) {
             res.status(500).json({ error: error.message });
         }
     });
+
+    // ==================== Vector Query with Scores ====================
+    router.post('/query-with-scores', async (req, res) => {
+        try {
+            const { collectionIds, searchText, source, model, threshold = 0.25, topK = 1 } = req.body;
+            if (!Array.isArray(collectionIds) || !searchText || !source) {
+                return res.status(400).json({ error: 'collectionIds, searchText, and source required' });
+            }
+
+            const vectorsDir = req.user.directories.vectors;
+            const sourceStr = sanitize(source);
+            const modelStr = sanitize(model || '');
+
+            // Get query vector via embedding provider
+            const queryVector = await getQueryVector(source, searchText, req.user.directories, model);
+
+            // Query each collection, get best match with score
+            const results = [];
+
+            for (const colId of collectionIds) {
+                const indexPath = path.join(vectorsDir, sourceStr, sanitize(colId), modelStr);
+                const store = new vectra.LocalIndex(indexPath);
+
+                if (!await store.isIndexCreated()) continue;
+
+                const matches = await store.queryItems(queryVector, topK);
+                for (const match of matches) {
+                    if (match.score < threshold) continue;
+                    results.push({
+                        collectionId: colId,
+                        score: Math.round(match.score * 1000) / 1000,
+                        text: match.item.metadata.text,
+                        hash: match.item.metadata.hash,
+                        index: match.item.metadata.index,
+                    });
+                }
+            }
+
+            // Sort by score descending
+            results.sort((a, b) => b.score - a.score);
+
+            res.json(results);
+        } catch (error) {
+            console.error('Query with scores error:', error);
+            res.status(500).json({ error: error.message });
+        }
+    });
+}
+
+async function getQueryVector(source, text, directories, model) {
+    switch (source) {
+        case 'togetherai':
+        case 'mistral':
+        case 'openai':
+        case 'electronhub':
+        case 'openrouter':
+        case 'chutes':
+        case 'nanogpt':
+        case 'siliconflow':
+            return getOpenAIVector(text, source, directories, model || '');
+        case 'transformers':
+            return getTransformersVector(text);
+        case 'cohere':
+            return getCohereVector(text, true, directories, model || '');
+        case 'nomicai':
+            return getNomicAIVector(text, source, directories);
+        case 'ollama':
+            return getOllamaVector(text, '', model || '', false, directories);
+        case 'llamacpp':
+            return getLlamaCppVector(text, '', directories);
+        case 'vllm':
+            return getVllmVector(text, '', model || '', directories);
+        default:
+            throw new Error(`Unsupported vector source: ${source}`);
+    }
 }
 
 // ==================== Vectorize a single chat ====================
 
-async function vectorizeChat(chat, chatsDir, vectorsDir, source, model, chunkSize, delimiters, cache, port, req) {
+async function vectorizeChat(chat, chatsDir, vectorsDir, source, model, rawSource, rawModel, chunkSize, delimiters, cache, port, req) {
     // Read messages
     const filePath = path.join(chatsDir, chat.character, chat.file + '.jsonl');
     const { messages } = readChat(filePath);
@@ -267,8 +363,8 @@ async function vectorizeChat(chat, chatsDir, vectorsDir, source, model, chunkSiz
                 headers,
                 body: JSON.stringify({
                     collectionId: chat.file,
-                    source,
-                    model,
+                    source: rawSource,
+                    model: rawModel,
                     items: batch,
                 }),
             });
