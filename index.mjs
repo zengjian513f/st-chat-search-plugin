@@ -2,14 +2,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import vectra from 'vectra';
 import sanitize from 'sanitize-filename';
-import { getConfigValue } from '../../src/util.js';
-import { getOpenAIVector } from '../../src/vectors/openai-vectors.js';
-import { getTransformersVector } from '../../src/vectors/embedding.js';
-import { getCohereVector } from '../../src/vectors/cohere-vectors.js';
-import { getNomicAIVector } from '../../src/vectors/nomicai-vectors.js';
-import { getOllamaVector } from '../../src/vectors/ollama-vectors.js';
-import { getLlamaCppVector } from '../../src/vectors/llamacpp-vectors.js';
-import { getVllmVector } from '../../src/vectors/vllm-vectors.js';
+import { getOpenAIVector, getOpenAIBatchVector } from '../../src/vectors/openai-vectors.js';
+import { getTransformersVector, getTransformersBatchVector } from '../../src/vectors/embedding.js';
+import { getCohereVector, getCohereBatchVector } from '../../src/vectors/cohere-vectors.js';
+import { getNomicAIVector, getNomicAIBatchVector } from '../../src/vectors/nomicai-vectors.js';
+import { getOllamaVector, getOllamaBatchVector } from '../../src/vectors/ollama-vectors.js';
+import { getLlamaCppVector, getLlamaCppBatchVector } from '../../src/vectors/llamacpp-vectors.js';
+import { getVllmVector, getVllmBatchVector } from '../../src/vectors/vllm-vectors.js';
 
 export const info = {
     id: 'chat-search',
@@ -24,7 +23,7 @@ export async function init(router) {
     // ==================== Keyword Search ====================
     router.post('/search', async (req, res) => {
         try {
-            const { query, scope = 'all', characterName, onePerChat = true } = req.body;
+            const { query, scope = 'all', characterName, onePerChat = true, days = 0 } = req.body;
 
             if (!query || !query.trim()) {
                 return res.status(400).json({ error: 'Query required' });
@@ -43,7 +42,8 @@ export async function init(router) {
                 const charPath = path.join(chatsDir, charName);
                 if (!fs.existsSync(charPath)) continue;
 
-                const files = safeReaddirSync(charPath).filter(f => f.endsWith('.jsonl'));
+                const allFiles = safeReaddirSync(charPath).filter(f => f.endsWith('.jsonl'));
+                const files = filterFilesByDays(allFiles, charPath, days);
 
                 for (const file of files) {
                     const { meta, messages } = readChat(path.join(charPath, file));
@@ -83,6 +83,7 @@ export async function init(router) {
     router.get('/vectorize-all', async (req, res) => {
         const { scope = 'all', characterName, source, model } = req.query;
         const chunkSize = Number(req.query.chunkSize) || 400;
+        const days = Number(req.query.days) || 0;
 
         if (!source) {
             return res.status(400).json({ error: 'source required' });
@@ -129,7 +130,8 @@ export async function init(router) {
                 const charPath = path.join(chatsDir, charName);
                 if (!fs.existsSync(charPath)) continue;
 
-                const files = safeReaddirSync(charPath).filter(f => f.endsWith('.jsonl'));
+                const allFiles = safeReaddirSync(charPath).filter(f => f.endsWith('.jsonl'));
+                const files = filterFilesByDays(allFiles, charPath, days);
                 for (const file of files) {
                     const collectionId = file.replace('.jsonl', '');
                     allChats.push({ character: charName, file: collectionId });
@@ -156,6 +158,7 @@ export async function init(router) {
 
             if (needsWork.length === 0) {
                 send('complete', { collectionIds: allChats.map(c => c.file) });
+                jobResolve();
                 res.end();
                 return;
             }
@@ -166,7 +169,6 @@ export async function init(router) {
             console.log(`[chat-search] Vector cache built: ${cache.size} unique hashes from ${readyIds.length} collections`);
 
             // Step 4: Process each chat
-            const port = getConfigValue('port', 8000, 'number');
             let done = 0;
 
             for (const chat of needsWork) {
@@ -178,7 +180,7 @@ export async function init(router) {
                 send('progress', { phase: 'vectorize', done, total: needsWork.length, message: `${chat.character}/${chat.file}` });
 
                 try {
-                    const stats = await vectorizeChat(chat, chatsDir, vectorsDir, sourceStr, modelStr, source, model || '', chunkSize, delimiters, cache, port, req, () => aborted);
+                    const stats = await vectorizeChat(chat, chatsDir, vectorsDir, sourceStr, modelStr, source, model || '', chunkSize, delimiters, cache, req, () => aborted);
                     console.log(`[chat-search] ${chat.file}: total=${stats.totalChunks}, cached=${stats.cached}, uncached=${stats.uncached}, API requests=${stats.apiRequests}`);
                 } catch (err) {
                     console.warn(`[chat-search] Failed to vectorize ${chat.file}:`, err.message);
@@ -217,6 +219,31 @@ export async function init(router) {
         } catch (error) {
             console.error('List chats error:', error);
             res.status(500).json({ error: error.message });
+        }
+    });
+
+    // ==================== Purge All Vectors ====================
+    router.post('/purge-all-vectors', async (req, res) => {
+        try {
+            const vectorsDir = req.user.directories.vectors;
+            if (!fs.existsSync(vectorsDir)) {
+                return res.json({ message: 'No vectors directory found', deleted: 0 });
+            }
+
+            const entries = safeReaddirSync(vectorsDir);
+            let deleted = 0;
+
+            for (const entry of entries) {
+                const entryPath = path.join(vectorsDir, entry);
+                await fs.promises.rm(entryPath, { recursive: true, force: true });
+                deleted++;
+            }
+
+            console.log(`[chat-search] Purged all vectors: removed ${deleted} entries from ${vectorsDir}`);
+            return res.json({ message: `Purged ${deleted} vector source(s)`, deleted });
+        } catch (error) {
+            console.error('[chat-search] Purge all vectors error:', error);
+            return res.status(500).json({ error: error.message });
         }
     });
 
@@ -298,7 +325,7 @@ async function getQueryVector(source, text, directories, model) {
 
 // ==================== Vectorize a single chat ====================
 
-async function vectorizeChat(chat, chatsDir, vectorsDir, source, model, rawSource, rawModel, chunkSize, delimiters, cache, port, req, isAborted) {
+async function vectorizeChat(chat, chatsDir, vectorsDir, source, model, rawSource, rawModel, chunkSize, delimiters, cache, req, isAborted) {
     // Read messages
     const filePath = path.join(chatsDir, chat.character, chat.file + '.jsonl');
     const { messages } = readChat(filePath);
@@ -334,14 +361,15 @@ async function vectorizeChat(chat, chatsDir, vectorsDir, source, model, rawSourc
         }
     }
 
+    // Prepare vectra store
+    const indexPath = path.join(vectorsDir, sanitize(source), sanitize(chat.file), sanitize(model));
+    const store = new vectra.LocalIndex(indexPath);
+    if (!await store.isIndexCreated()) {
+        await store.createIndex();
+    }
+
     // Insert cached items directly via vectra
     if (cachedItems.length > 0) {
-        const indexPath = path.join(vectorsDir, source, sanitize(chat.file), model);
-        const store = new vectra.LocalIndex(indexPath);
-        if (!await store.isIndexCreated()) {
-            await store.createIndex();
-        }
-
         await store.beginUpdate();
         for (const item of cachedItems) {
             for (const cv of item.cachedVectors) {
@@ -354,52 +382,47 @@ async function vectorizeChat(chat, chatsDir, vectorsDir, source, model, rawSourc
         await store.endUpdate();
     }
 
-    // Call embedding API for uncached items
+    // Embed uncached items directly (no HTTP self-call)
     let apiRequests = 0;
     if (uncachedItems.length > 0) {
-        const batchSize = 10;
-        const headers = {
-            'Content-Type': 'application/json',
-            'Cookie': req.headers.cookie || '',
-            'X-CSRF-Token': req.headers['x-csrf-token'] || '',
-        };
-
+        const batchSize = 50;
+        const concurrency = 3;
+        const batches = [];
         for (let i = 0; i < uncachedItems.length; i += batchSize) {
+            batches.push(uncachedItems.slice(i, i + batchSize));
+        }
+
+        // Process batches with concurrency
+        for (let i = 0; i < batches.length; i += concurrency) {
             if (isAborted()) break;
-            const batch = uncachedItems.slice(i, i + batchSize);
-            apiRequests++;
+            const concurrent = batches.slice(i, i + concurrency);
+            const results = await Promise.all(concurrent.map(async (batch) => {
+                const texts = batch.map(x => x.text);
+                const vectors = await getBatchVectorDirect(rawSource, texts, req.user.directories, rawModel);
+                return { batch, vectors };
+            }));
+            apiRequests += concurrent.length;
 
-            const resp = await fetch(`http://127.0.0.1:${port}/api/vector/insert`, {
-                method: 'POST',
-                headers,
-                body: JSON.stringify({
-                    collectionId: chat.file,
-                    source: rawSource,
-                    model: rawModel,
-                    items: batch,
-                }),
-            });
+            // Write all results to vectra
+            await store.beginUpdate();
+            for (const { batch, vectors } of results) {
+                for (let j = 0; j < batch.length; j++) {
+                    const item = batch[j];
+                    const vector = vectors[j];
+                    await store.upsertItem({
+                        vector,
+                        metadata: { hash: item.hash, text: item.text, index: item.index },
+                    });
 
-            if (!resp.ok) {
-                throw new Error(`Vector insert API returned ${resp.status}`);
-            }
-
-            // Add newly embedded vectors to cache
-            try {
-                const indexPath = path.join(vectorsDir, source, sanitize(chat.file), model, 'index.json');
-                if (fs.existsSync(indexPath)) {
-                    const data = JSON.parse(fs.readFileSync(indexPath, 'utf-8'));
-                    for (const vecItem of (data.items || [])) {
-                        const h = Number(vecItem.metadata?.hash);
-                        if (!h || !vecItem.vector) continue;
-                        if (!cache.has(h)) cache.set(h, []);
-                        const arr = cache.get(h);
-                        if (!arr.some(e => e.text === vecItem.metadata.text)) {
-                            arr.push({ vector: vecItem.vector, text: vecItem.metadata.text });
-                        }
+                    // Update cache
+                    if (!cache.has(item.hash)) cache.set(item.hash, []);
+                    const arr = cache.get(item.hash);
+                    if (!arr.some(e => e.text === item.text)) {
+                        arr.push({ vector, text: item.text });
                     }
                 }
-            } catch { /* ignore cache update errors */ }
+            }
+            await store.endUpdate();
         }
     }
 
@@ -409,6 +432,42 @@ async function vectorizeChat(chat, chatsDir, vectorsDir, source, model, rawSourc
         uncached: uncachedItems.length,
         apiRequests,
     };
+}
+
+/**
+ * Directly call embedding provider, bypassing HTTP self-call.
+ * @param {string} source - The embedding source name
+ * @param {string[]} texts - Texts to embed
+ * @param {object} directories - User directories
+ * @param {string} model - Model name
+ * @returns {Promise<number[][]>} - Vectors
+ */
+async function getBatchVectorDirect(source, texts, directories, model) {
+    switch (source) {
+        case 'togetherai':
+        case 'mistral':
+        case 'openai':
+        case 'electronhub':
+        case 'openrouter':
+        case 'chutes':
+        case 'nanogpt':
+        case 'siliconflow':
+            return getOpenAIBatchVector(texts, source, directories, model);
+        case 'transformers':
+            return getTransformersBatchVector(texts);
+        case 'cohere':
+            return getCohereBatchVector(texts, false, directories, model);
+        case 'nomicai':
+            return getNomicAIBatchVector(texts, source, directories);
+        case 'ollama':
+            return getOllamaBatchVector(texts, '', model, false, directories);
+        case 'llamacpp':
+            return getLlamaCppBatchVector(texts, '', directories);
+        case 'vllm':
+            return getVllmBatchVector(texts, '', model, directories);
+        default:
+            throw new Error(`Unsupported embedding source: ${source}`);
+    }
 }
 
 // ==================== Vector Cache ====================
@@ -492,6 +551,50 @@ function splitRecursive(input, length, delimiters = ['\n\n', '\n', ' ', '']) {
         result.push(currentChunk);
     }
     return result;
+}
+
+/**
+ * Get the last message's send_date from a chat file.
+ * Reads only the last line for efficiency.
+ * @param {string} filePath - Full path to .jsonl file
+ * @returns {Date|null}
+ */
+function getLastMessageDate(filePath) {
+    try {
+        const content = fs.readFileSync(filePath, 'utf-8');
+        const lines = content.split('\n').filter(Boolean);
+        // Walk backwards to find the last message (skip metadata-only lines)
+        for (let i = lines.length - 1; i >= 0; i--) {
+            try {
+                const msg = JSON.parse(lines[i]);
+                if (msg.send_date) {
+                    // Normalize "8:37am" → "8:37 am" for Date parsing
+                    const normalized = String(msg.send_date).replace(/(\d)(am|pm)/i, '$1 $2');
+                    const d = new Date(normalized);
+                    if (!isNaN(d.getTime())) return d;
+                }
+            } catch { /* skip */ }
+        }
+    } catch { /* file read error */ }
+    return null;
+}
+
+/**
+ * Filter chat files by days based on last message date. 0 = no filter.
+ * @param {string[]} files - Array of .jsonl filenames
+ * @param {string} dirPath - Directory containing the files
+ * @param {number} days - Number of days (0 = unlimited)
+ * @returns {string[]}
+ */
+function filterFilesByDays(files, dirPath, days) {
+    if (!days || days <= 0) return files;
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - days);
+    cutoff.setHours(0, 0, 0, 0);
+    return files.filter(f => {
+        const d = getLastMessageDate(path.join(dirPath, f));
+        return d ? d >= cutoff : true; // keep files we can't parse
+    });
 }
 
 function getCharDirs(chatsDir, scope, characterName) {
